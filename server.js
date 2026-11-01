@@ -1,6 +1,10 @@
 import express from 'express';
 import multer from 'multer';
 import pino from 'pino';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { pipeline } from 'stream/promises';
 import { MongoClient, GridFSBucket } from 'mongodb';
 import makeWASocket, {
   Browsers, DisconnectReason, initAuthCreds, BufferJSON, proto,
@@ -75,18 +79,24 @@ async function startSock() {
 }
 await startSock();
 
+// Files go through the disk (not memory), so big files like APKs fit on the free server
 async function sendOne(m) {
   const jid = m.phone + '@s.whatsapp.net';
   if (!m.fileId) return sock.sendMessage(jid, { text: m.text });
-  const chunks = [];
-  for await (const c of bucket.openDownloadStream(m.fileId)) chunks.push(c);
-  const buf = Buffer.concat(chunks);
-  let content;
-  if (m.mime?.startsWith('image/')) content = { image: buf, caption: m.text };
-  else if (m.mime?.startsWith('video/')) content = { video: buf, caption: m.text };
-  else content = { document: buf, fileName: m.fileName,
-    mimetype: m.mime || 'application/octet-stream', caption: m.text };
-  return sock.sendMessage(jid, content);
+  const tmp = path.join(os.tmpdir(), 'send-' + String(m._id));
+  try {
+    await pipeline(bucket.openDownloadStream(m.fileId), fs.createWriteStream(tmp));
+    const src = { url: tmp };
+    let content;
+    if (m.mime?.startsWith('image/')) content = { image: src, caption: m.text };
+    else if (m.mime?.startsWith('video/')) content = { video: src, caption: m.text };
+    else content = { document: src, fileName: m.fileName,
+      mimetype: m.mime || 'application/octet-stream', caption: m.text };
+    await sock.sendMessage(jid, content);
+  } finally {
+    fs.promises.unlink(tmp).catch(() => {});
+  }
+  await bucket.delete(m.fileId).catch(() => {});   // free database space after sending
 }
 
 // Scheduler: every 5s sends anything due (also catches up after a restart)
@@ -112,7 +122,7 @@ setInterval(async () => {
 }, 5000);
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 60 * 1024 * 1024 } });
+const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 100 * 1024 * 1024 } });
 app.use(express.json());
 app.get('/health', (_, res) => res.send('ok'));
 app.use((req, res, next) =>
@@ -132,15 +142,20 @@ app.post('/schedule', upload.single('file'), async (req, res) => {
   try {
     const { phone, text = '', sendAt } = req.body;
     const when = new Date(sendAt);
-    if (!phone || isNaN(when)) return res.status(400).json({ error: 'bad input' });
+    if (!phone || isNaN(when)) {
+      if (req.file) fs.promises.unlink(req.file.path).catch(() => {});
+      return res.status(400).json({ error: 'bad input' });
+    }
     let fileId = null, fileName = null, mime = null;
     if (req.file) {
       fileName = req.file.originalname; mime = req.file.mimetype;
-      fileId = await new Promise((ok, fail) => {
-        const up = bucket.openUploadStream(fileName);
-        up.on('finish', () => ok(up.id)); up.on('error', fail);
-        up.end(req.file.buffer);
-      });
+      const up = bucket.openUploadStream(fileName);
+      try {
+        await pipeline(fs.createReadStream(req.file.path), up);
+        fileId = up.id;
+      } finally {
+        fs.promises.unlink(req.file.path).catch(() => {});
+      }
     }
     const r = await msgs.insertOne({ phone: phone.replace(/\D/g, ''), text, sendAt: when,
       status: 'pending', fileId, fileName, mime, createdAt: new Date() });
@@ -151,5 +166,9 @@ app.post('/schedule', upload.single('file'), async (req, res) => {
 app.get('/messages', async (_, res) =>
   res.json(await msgs.find({}, { projection: { fileId: 0 } })
     .sort({ createdAt: -1 }).limit(50).toArray()));
+
+// Shows the real error (for example "File too large") instead of a blank page
+app.use((err, req, res, next) =>
+  res.status(400).json({ error: err.message || String(err) }));
 
 app.listen(PORT, '0.0.0.0');
