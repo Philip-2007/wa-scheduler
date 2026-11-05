@@ -5,7 +5,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { pipeline } from 'stream/promises';
-import { MongoClient, GridFSBucket } from 'mongodb';
+import { MongoClient, GridFSBucket, ObjectId } from 'mongodb';
 import makeWASocket, {
   Browsers, DisconnectReason, initAuthCreds, BufferJSON, proto,
   fetchLatestBaileysVersion
@@ -166,6 +166,37 @@ app.post('/schedule', upload.single('file'), async (req, res) => {
 app.get('/messages', async (_, res) =>
   res.json(await msgs.find({}, { projection: { fileId: 0 } })
     .sort({ createdAt: -1 }).limit(50).toArray()));
+
+// Edit a message that is still pending (or failed): number, text, time
+app.put('/messages/:id', async (req, res) => {
+  try {
+    const set = { status: 'pending' };
+    if (req.body.phone) set.phone = String(req.body.phone).replace(/\D/g, '');
+    if (typeof req.body.text === 'string') set.text = req.body.text;
+    if (req.body.sendAt) {
+      const when = new Date(req.body.sendAt);
+      if (isNaN(when)) return res.status(400).json({ error: 'bad time' });
+      set.sendAt = when;
+    }
+    const r = await msgs.updateOne(
+      { _id: new ObjectId(req.params.id), status: { $in: ['pending', 'failed'] } },
+      { $set: set, $unset: { error: '' } });
+    if (!r.matchedCount)
+      return res.status(409).json({ error: 'Only pending or failed messages can be edited' });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Delete a message (and its file) unless it is being sent right now
+app.delete('/messages/:id', async (req, res) => {
+  try {
+    const m = await msgs.findOneAndDelete(
+      { _id: new ObjectId(req.params.id), status: { $ne: 'sending' } });
+    if (!m) return res.status(409).json({ error: 'Not found, or being sent right now' });
+    if (m.fileId) await bucket.delete(m.fileId).catch(() => {});
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
 
 // Shows the real error (for example "File too large") instead of a blank page
 app.use((err, req, res, next) =>
